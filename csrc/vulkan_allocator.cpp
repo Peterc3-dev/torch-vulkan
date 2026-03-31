@@ -2,6 +2,7 @@
 #include "vulkan_context.h"
 #include <c10/core/Device.h>
 #include <cstring>
+#include <cstdio>
 
 namespace torch_vulkan {
 
@@ -11,20 +12,22 @@ VulkanAllocator& VulkanAllocator::instance() {
 }
 
 c10::DataPtr VulkanAllocator::allocate(size_t nbytes) {
+  fprintf(stderr, "ALLOC: nbytes=%zu\n", nbytes);
   if (nbytes == 0) {
     return c10::DataPtr(nullptr, c10::Device(c10::DeviceType::PrivateUse1, 0));
   }
 
+  fprintf(stderr, "ALLOC: getting manager\n");
   auto& mgr = VulkanContext::instance().manager();
+  fprintf(stderr, "ALLOC: got manager\n");
 
-  // Allocate as float buffer (round up)
   size_t num_floats = (nbytes + sizeof(float) - 1) / sizeof(float);
   std::vector<float> zeros(num_floats, 0.0f);
 
+  fprintf(stderr, "ALLOC: creating kompute tensor, num_floats=%zu\n", num_floats);
   auto tensor = mgr.tensor(zeros);
+  fprintf(stderr, "ALLOC: tensor created\n");
 
-  // The data pointer for PyTorch is the host-side staging buffer.
-  // When we dispatch ops, we sync to GPU, run shader, sync back.
   void* ptr = tensor->data();
 
   {
@@ -48,7 +51,6 @@ void VulkanAllocator::deleter(void* ptr) {
   auto& alloc = VulkanAllocator::instance();
   std::lock_guard<std::mutex> lock(alloc.mutex_);
   alloc.tensor_map_.erase(ptr);
-  // Kompute tensor destructor handles Vulkan buffer cleanup
 }
 
 void VulkanAllocator::copy_data(void* dest, const void* src, std::size_t count) const {

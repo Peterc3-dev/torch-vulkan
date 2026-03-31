@@ -8,10 +8,6 @@
 
 namespace torch_vulkan {
 
-// Custom allocator that backs PyTorch tensors with Kompute GPU buffers.
-// When PyTorch requests memory for a "vulkan" tensor, this allocator
-// creates a Kompute tensor (Vulkan buffer) and returns a pointer to
-// the host-mapped staging buffer.
 class VulkanAllocator final : public c10::Allocator {
 public:
   static VulkanAllocator& instance();
@@ -20,10 +16,6 @@ public:
   c10::DeleterFnPtr raw_deleter() const override;
   void copy_data(void* dest, const void* src, std::size_t count) const override;
 
-  void copy_data(void* dest, const void* src, std::size_t count) const override { std::memcpy(dest, src, count); }
-
-  // Retrieve the Kompute tensor backing a given data pointer.
-  // Needed when dispatching ops — we need the GPU buffer, not the host ptr.
   std::shared_ptr<kp::TensorT<float>> get_kompute_tensor(void* ptr);
 
 private:
@@ -32,7 +24,6 @@ private:
   static void deleter(void* ptr);
 
   std::mutex mutex_;
-  // Map from host data pointer -> Kompute tensor
   std::unordered_map<void*, std::shared_ptr<kp::TensorT<float>>> tensor_map_;
 };
 

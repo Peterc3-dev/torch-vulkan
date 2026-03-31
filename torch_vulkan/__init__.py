@@ -44,3 +44,9 @@ def device_name() -> str:
 def device(index: int = 0) -> torch.device:
     """Return a torch.device for the Vulkan backend."""
     return torch.device("vulkan", index)
+
+
+# Register as torch.vulkan so .to("vulkan") works
+# PyTorch's PrivateUse1 dispatch does "import torch.<backend_name>"
+import sys
+sys.modules['torch.vulkan'] = sys.modules[__name__]

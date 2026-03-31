@@ -2,80 +2,54 @@
 #include <ATen/NativeFunctions.h>
 #include "../vulkan_allocator.h"
 #include "../vulkan_context.h"
-#include <ATen/Functions.h>
 #include <ATen/core/op_registration/op_registration.h>
 #include <ATen/native/CPUFallback.h>
 #include <torch/library.h>
+#include <cstring>
 
 namespace torch_vulkan {
 namespace ops {
 
 // aten::mm — matrix multiplication via matmul.spv
-// This is the first operator. Get this working and the rest follow the pattern.
 at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
   TORCH_CHECK(self.dim() == 2, "mm: self must be 2D");
   TORCH_CHECK(mat2.dim() == 2, "mm: mat2 must be 2D");
-  TORCH_CHECK(
-      self.size(1) == mat2.size(0),
-      "mm: self.size(1) must match mat2.size(0)");
-  TORCH_CHECK(self.dtype() == at::kFloat, "mm: only float32 supported (for now)");
+  TORCH_CHECK(self.size(1) == mat2.size(0), "mm: dimension mismatch");
+  TORCH_CHECK(self.dtype() == at::kFloat, "mm: only float32 for now");
 
-  int64_t M = self.size(0);
-  int64_t K = self.size(1);
-  int64_t N = mat2.size(1);
-
-  // For the square matmul shader, K must equal N must equal M.
-  // TODO: Generalize the shader for non-square matrices.
-  // For now, pad to max dim and use the square kernel.
+  int64_t M = self.size(0), K = self.size(1), N = mat2.size(1);
   int64_t dim = std::max({M, K, N});
 
   auto& ctx = VulkanContext::instance();
   auto& mgr = ctx.manager();
-
-  // Get input data (ensure contiguous)
   auto self_c = self.contiguous();
   auto mat2_c = mat2.contiguous();
 
-  // Create Kompute tensors from input data
   std::vector<float> a_data(dim * dim, 0.0f);
   std::vector<float> b_data(dim * dim, 0.0f);
   std::vector<float> c_data(dim * dim, 0.0f);
 
-  // Copy input data into padded buffers
   const float* a_ptr = self_c.data_ptr<float>();
   const float* b_ptr = mat2_c.data_ptr<float>();
-  for (int64_t i = 0; i < M; i++) {
-    for (int64_t j = 0; j < K; j++) {
+  for (int64_t i = 0; i < M; i++)
+    for (int64_t j = 0; j < K; j++)
       a_data[i * dim + j] = a_ptr[i * K + j];
-    }
-  }
-  for (int64_t i = 0; i < K; i++) {
-    for (int64_t j = 0; j < N; j++) {
+  for (int64_t i = 0; i < K; i++)
+    for (int64_t j = 0; j < N; j++)
       b_data[i * dim + j] = b_ptr[i * N + j];
-    }
-  }
 
   auto tensor_a = mgr.tensor(a_data);
   auto tensor_b = mgr.tensor(b_data);
   auto tensor_c = mgr.tensor(c_data);
 
-  // Load the matmul shader
   auto spirv = ctx.load_shader("matmul");
-
-  // Push constant: N dimension
   uint32_t n_val = static_cast<uint32_t>(dim);
+  uint32_t wg_x = (dim + 15) / 16, wg_y = (dim + 15) / 16;
 
-  // Workgroup dispatch: ceil(dim/16) x ceil(dim/16)
-  uint32_t wg_x = (dim + 15) / 16;
-  uint32_t wg_y = (dim + 15) / 16;
-
-  // Record and execute
   auto algorithm = mgr.algorithm(
-      {tensor_a, tensor_b, tensor_c},
-      spirv,
-      kp::Workgroup({wg_x, wg_y, 1}),
-      {},                                    // specialization constants
-      std::vector<uint32_t>{n_val});         // push constants
+      {tensor_a, tensor_b, tensor_c}, spirv,
+      kp::Workgroup({wg_x, wg_y, 1}), {},
+      std::vector<uint32_t>{n_val});
 
   auto seq = mgr.sequence();
   seq->record<kp::OpTensorSyncDevice>({tensor_a, tensor_b});
@@ -83,32 +57,79 @@ at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
   seq->record<kp::OpTensorSyncLocal>({tensor_c});
   seq->eval();
 
-  // Extract result into a new PyTorch tensor
   auto output = at::empty({M, N}, self.options());
   float* out_ptr = output.data_ptr<float>();
   const float* c_ptr = tensor_c->data();
-  for (int64_t i = 0; i < M; i++) {
-    for (int64_t j = 0; j < N; j++) {
+  for (int64_t i = 0; i < M; i++)
+    for (int64_t j = 0; j < N; j++)
       out_ptr[i * N + j] = c_ptr[i * dim + j];
-    }
-  }
 
   return output;
 }
 
-// aten::add.Tensor — elementwise addition
-at::Tensor add(
+// _to_copy — this is what .to(device) actually calls
+at::Tensor vulkan_to_copy(
     const at::Tensor& self,
-    const at::Tensor& other,
-    const at::Scalar& alpha) {
-  // TODO: Implement via Vulkan compute shader
-  // For now, fall back to CPU
-  auto cpu_result =
-      at::add(self.to(at::kCPU), other.to(at::kCPU), alpha);
-  return cpu_result.to(self.device());
+    std::optional<at::ScalarType> dtype,
+    std::optional<at::Layout> layout,
+    std::optional<at::Device> device,
+    std::optional<bool> pin_memory,
+    bool non_blocking,
+    std::optional<at::MemoryFormat> memory_format) {
+
+  auto target_device = device.value_or(self.device());
+  auto target_dtype = dtype.value_or(self.scalar_type());
+
+  if (target_device.type() == c10::DeviceType::PrivateUse1) {
+    // Something -> Vulkan
+    auto self_cpu = self.device().type() == c10::DeviceType::CPU
+        ? self.contiguous()
+        : self.to(at::kCPU).contiguous();
+    auto self_float = self_cpu.to(target_dtype).contiguous();
+
+    auto result = at::empty(self_float.sizes(),
+        self_float.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
+    std::memcpy(result.data_ptr(), self_float.data_ptr(),
+        self_float.numel() * self_float.element_size());
+    return result;
+
+  } else if (target_device.type() == c10::DeviceType::CPU) {
+    // Vulkan -> CPU
+    auto result = at::empty(self.sizes(),
+        at::TensorOptions().dtype(target_dtype).device(at::kCPU));
+    std::memcpy(result.data_ptr(), self.data_ptr(),
+        self.numel() * self.element_size());
+    return result;
+
+  } else {
+    TORCH_CHECK(false, "_to_copy: unsupported target device ", target_device);
+  }
 }
 
-// aten::empty.memory_format — tensor creation on Vulkan device
+// copy_ — in-place copy between devices
+at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
+  auto src_c = src.contiguous();
+  TORCH_CHECK(self.numel() == src_c.numel(), "copy_: size mismatch");
+
+  if (self.device().type() == c10::DeviceType::PrivateUse1 &&
+      src_c.device().type() == c10::DeviceType::CPU) {
+    std::memcpy(self.data_ptr(), src_c.data_ptr(),
+        src_c.numel() * src_c.element_size());
+  } else if (self.device().type() == c10::DeviceType::CPU &&
+             src_c.device().type() == c10::DeviceType::PrivateUse1) {
+    std::memcpy(self.data_ptr(), src_c.data_ptr(),
+        src_c.numel() * src_c.element_size());
+  } else if (self.device().type() == c10::DeviceType::PrivateUse1 &&
+             src_c.device().type() == c10::DeviceType::PrivateUse1) {
+    std::memcpy(self.data_ptr(), src_c.data_ptr(),
+        src_c.numel() * src_c.element_size());
+  } else {
+    TORCH_CHECK(false, "copy_: unsupported device combination");
+  }
+  return self;
+}
+
+// aten::empty.memory_format
 at::Tensor empty_memory_format(
     at::IntArrayRef size,
     std::optional<at::ScalarType> dtype,
@@ -124,11 +145,8 @@ at::Tensor empty_memory_format(
   size_t nbytes = nelements * at::elementSize(actual_dtype);
 
   auto storage = c10::Storage(
-      c10::Storage::use_byte_size_t(),
-      nbytes,
-      allocator->allocate(nbytes),
-      allocator,
-      true);
+      c10::Storage::use_byte_size_t(), nbytes,
+      allocator->allocate(nbytes), allocator, true);
 
   auto tensor = at::detail::make_tensor<c10::TensorImpl>(
       std::move(storage),
@@ -136,25 +154,21 @@ at::Tensor empty_memory_format(
       at::scalarTypeToTypeMeta(actual_dtype));
 
   tensor.unsafeGetTensorImpl()->set_sizes_contiguous(size);
-
   return tensor;
 }
 
-// CPU fallback for unimplemented ops
-void cpu_fallback(
-    const c10::OperatorHandle& op,
-    torch::jit::Stack* stack) {
+// CPU fallback — but NOT for copy/transfer ops
+void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   at::native::cpu_fallback(op, stack);
 }
 
-// Register all operators with the PrivateUse1 dispatch key
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("mm", &mm);
-  m.impl("add.Tensor", &add);
   m.impl("empty.memory_format", &empty_memory_format);
+  m.impl("_to_copy", &vulkan_to_copy);
+  m.impl("copy_", &vulkan_copy_);
 }
 
-// Catch-all: any unregistered op falls back to CPU
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&cpu_fallback>());
 }
