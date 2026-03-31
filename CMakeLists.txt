@@ -3,12 +3,14 @@ project(torch_vulkan LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Find Python (needed for torch/extension.h -> Python.h)
 find_package(Python3 COMPONENTS Development REQUIRED)
 
 # Find PyTorch
 find_package(Torch REQUIRED)
+find_package(Python3 COMPONENTS Development REQUIRED)
 
 # Find Vulkan SDK
 find_package(Vulkan REQUIRED)

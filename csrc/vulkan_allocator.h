@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstring>
 #include <c10/core/Allocator.h>
 #include <kompute/Kompute.hpp>
 #include <mutex>
@@ -18,6 +19,8 @@ public:
   c10::DataPtr allocate(size_t nbytes) override;
   c10::DeleterFnPtr raw_deleter() const override;
   void copy_data(void* dest, const void* src, std::size_t count) const override;
+
+  void copy_data(void* dest, const void* src, std::size_t count) const override { std::memcpy(dest, src, count); }
 
   // Retrieve the Kompute tensor backing a given data pointer.
   // Needed when dispatching ops — we need the GPU buffer, not the host ptr.

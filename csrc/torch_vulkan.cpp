@@ -85,7 +85,7 @@ PYBIND11_MODULE(_C, m) {
 
   // Rename PrivateUse1 -> "vulkan"
   // This gives us: tensor.vulkan(), tensor.is_vulkan, torch.device("vulkan")
-  torch::rename_privateuse1_backend("vulkan");
+  c10::register_privateuse1_backend("vulkan");
 
   // Register our allocator for the vulkan device
   c10::SetAllocator(

@@ -1,3 +1,5 @@
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
 #include "../vulkan_allocator.h"
 #include "../vulkan_context.h"
 #include <ATen/Functions.h>
