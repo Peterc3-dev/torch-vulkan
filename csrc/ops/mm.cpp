@@ -1,5 +1,6 @@
 #include "../vulkan_allocator.h"
 #include "../vulkan_context.h"
+#include <ATen/Functions.h>
 #include <ATen/core/op_registration/op_registration.h>
 #include <ATen/native/CPUFallback.h>
 #include <torch/library.h>

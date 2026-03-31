@@ -4,6 +4,9 @@ project(torch_vulkan LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Find Python (needed for torch/extension.h -> Python.h)
+find_package(Python3 COMPONENTS Development REQUIRED)
+
 # Find PyTorch
 find_package(Torch REQUIRED)
 
@@ -51,8 +54,11 @@ target_include_directories(torch_vulkan_C PRIVATE
   ${Vulkan_INCLUDE_DIRS}
   ${KOMPUTE_INCLUDE_DIR}
   ${Python3_INCLUDE_DIRS}
+  ${pybind11_INCLUDE_DIRS}
   csrc/
 )
+
+target_link_libraries(torch_vulkan_C PRIVATE Python3::Python)
 
 target_link_libraries(torch_vulkan_C PRIVATE
   ${TORCH_LIBRARIES}

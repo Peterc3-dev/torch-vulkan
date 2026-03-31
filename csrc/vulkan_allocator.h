@@ -17,6 +17,7 @@ public:
 
   c10::DataPtr allocate(size_t nbytes) override;
   c10::DeleterFnPtr raw_deleter() const override;
+  void copy_data(void* dest, const void* src, std::size_t count) const override;
 
   // Retrieve the Kompute tensor backing a given data pointer.
   // Needed when dispatching ops — we need the GPU buffer, not the host ptr.

@@ -1,6 +1,7 @@
 #include "vulkan_allocator.h"
 #include "vulkan_context.h"
 #include <c10/core/Device.h>
+#include <cstring>
 
 namespace torch_vulkan {
 
@@ -48,6 +49,10 @@ void VulkanAllocator::deleter(void* ptr) {
   std::lock_guard<std::mutex> lock(alloc.mutex_);
   alloc.tensor_map_.erase(ptr);
   // Kompute tensor destructor handles Vulkan buffer cleanup
+}
+
+void VulkanAllocator::copy_data(void* dest, const void* src, std::size_t count) const {
+  std::memcpy(dest, src, count);
 }
 
 std::shared_ptr<kp::TensorT<float>> VulkanAllocator::get_kompute_tensor(void* ptr) {
