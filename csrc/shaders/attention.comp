@@ -1,0 +1,58 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Q { float q[]; };
+layout(set = 0, binding = 1) buffer K { float k[]; };
+layout(set = 0, binding = 2) buffer V { float v[]; };
+layout(set = 0, binding = 3) buffer Out { float out_data[]; };
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint head_dim;
+} params;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= params.seq_len) return;
+
+    uint d = params.head_dim;
+    float inv_sqrt_d = 1.0 / sqrt(float(d));
+
+    // Compute attention scores for this row: Q[row] * K^T
+    // Then softmax, then weighted sum of V
+    float max_score = -1e9;
+    
+    // Pass 1: compute scores and find max
+    for (uint j = 0; j < params.seq_len; j++) {
+        float score = 0.0;
+        for (uint dd = 0; dd < d; dd++) {
+            score += q[row * d + dd] * k[j * d + dd];
+        }
+        score *= inv_sqrt_d;
+        if (score > max_score) max_score = score;
+    }
+
+    // Pass 2: compute exp and sum
+    float exp_sum = 0.0;
+    for (uint j = 0; j < params.seq_len; j++) {
+        float score = 0.0;
+        for (uint dd = 0; dd < d; dd++) {
+            score += q[row * d + dd] * k[j * d + dd];
+        }
+        score *= inv_sqrt_d;
+        exp_sum += exp(score - max_score);
+    }
+
+    // Pass 3: weighted sum of V
+    for (uint dd = 0; dd < d; dd++) {
+        float val = 0.0;
+        for (uint j = 0; j < params.seq_len; j++) {
+            float score = 0.0;
+            for (uint kk = 0; kk < d; kk++) {
+                score += q[row * d + kk] * k[j * d + kk];
+            }
+            score *= inv_sqrt_d;
+            float weight = exp(score - max_score) / exp_sum;
+            val += weight * v[j * d + dd];
+        }
+        out_data[row * d + dd] = val;
+    }
+}
