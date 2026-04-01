@@ -143,7 +143,7 @@ at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
   auto output = at::empty({M, N}, self.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
   auto tensor_c = get_kp_tensor(output);
 
-  auto spirv = ctx.load_shader("matmul_general");
+  auto spirv = ctx.load_shader("matmul_tiled");
   uint32_t m_val = static_cast<uint32_t>(M);
   uint32_t k_val = static_cast<uint32_t>(K);
   uint32_t n_val = static_cast<uint32_t>(N);
