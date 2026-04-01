@@ -46,6 +46,27 @@ def device(index: int = 0) -> torch.device:
     return torch.device("vulkan", index)
 
 
+def cache_stats() -> dict:
+    """Return algorithm cache hit/miss statistics (Phase 4).
+
+    Returns a dict with keys:
+      algo_hits:   number of times a cached Algorithm was reused
+      algo_misses: number of times a new Algorithm was created
+      seq_reuses:  number of times a Sequence was reused from pool
+      seq_creates: number of times a new Sequence was created
+    """
+    return _C._cache_stats()
+
+
+def clear_algorithm_cache():
+    """Clear all cached Vulkan algorithms.
+
+    Call this if you notice memory pressure from too many cached pipelines,
+    or after model weights change and old descriptors are stale.
+    """
+    _C._clear_algorithm_cache()
+
+
 # Register as torch.vulkan so .to("vulkan") works
 # PyTorch's PrivateUse1 dispatch does "import torch.<backend_name>"
 import sys

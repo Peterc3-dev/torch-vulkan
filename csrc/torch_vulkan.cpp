@@ -78,10 +78,29 @@ bool is_available() {
   }
 }
 
+// Phase 4: Expose cache statistics to Python for benchmarking.
+py::dict cache_stats() {
+  auto stats = VulkanContext::instance().cache_stats();
+  py::dict d;
+  d["algo_hits"] = stats.algo_hits;
+  d["algo_misses"] = stats.algo_misses;
+  d["seq_reuses"] = stats.seq_reuses;
+  d["seq_creates"] = stats.seq_creates;
+  return d;
+}
+
+void clear_algorithm_cache() {
+  VulkanContext::instance().clear_algorithm_cache();
+}
+
 PYBIND11_MODULE(_C, m) {
   m.def("_set_shader_dir", &set_shader_dir);
   m.def("_device_name", &device_name);
   m.def("_is_available", &is_available);
+  m.def("_cache_stats", &cache_stats,
+        "Return algorithm cache hit/miss statistics (Phase 4)");
+  m.def("_clear_algorithm_cache", &clear_algorithm_cache,
+        "Clear all cached Vulkan algorithms");
 
   // Rename PrivateUse1 -> "vulkan"
   // This gives us: tensor.vulkan(), tensor.is_vulkan, torch.device("vulkan")

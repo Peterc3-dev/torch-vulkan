@@ -94,7 +94,10 @@ std::shared_ptr<kp::Algorithm> VulkanContext::get_or_create_algorithm(
     // Update mutable state: push constants and workgroup.
     auto& algo = it->second;
     if (!push_constants.empty()) {
-      algo->setPushConstants(const_cast<void*>(static_cast<const void*>(push_constants.data())), static_cast<uint32_t>(push_constants.size()), static_cast<uint32_t>(sizeof(uint32_t)));
+      algo->setPushConstants(
+          const_cast<void*>(static_cast<const void*>(push_constants.data())),
+          static_cast<uint32_t>(push_constants.size()),
+          static_cast<uint32_t>(sizeof(uint32_t)));
     }
     algo->setWorkgroup(workgroup, tensors.size() ? tensors[0]->size() : 1);
     stats_.algo_hits++;
@@ -102,13 +105,11 @@ std::shared_ptr<kp::Algorithm> VulkanContext::get_or_create_algorithm(
   }
 
   // Cache miss: create new algorithm and cache it.
+  // Check shader cache inline (load_shader would deadlock since we hold mutex_).
   auto spirv = shader_cache_.count(shader_name)
       ? shader_cache_[shader_name]
       : std::vector<uint32_t>{};
 
-  // If spirv not in cache yet, load it (dropping lock temporarily is not
-  // needed since we already hold it and load_shader would deadlock --
-  // so we do the file I/O inline).
   if (spirv.empty()) {
     std::string path = shader_dir_ + shader_name + ".spv";
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -142,19 +143,12 @@ std::shared_ptr<kp::Sequence> VulkanContext::acquire_sequence() {
   }
 
   stats_.seq_creates++;
-  // Must release lock before calling manager (no re-entrant mutex).
-  // But we hold it -- that's fine, manager().sequence() doesn't need our lock.
   return mgr_->sequence();
 }
 
 void VulkanContext::release_sequence(std::shared_ptr<kp::Sequence> seq) {
   // Sequences in Kompute create their command pool without the RESET bit,
   // so the command buffer cannot be reused after recording+eval.
-  // We can still pool the Sequence object to avoid the command pool and
-  // command buffer allocation on the next call -- but only if we destroy
-  // and recreate the internal command buffer. Since Kompute's Sequence
-  // doesn't expose a reset API, pooling won't help here.
-  //
   // Just let the sequence drop. The main perf win is from Algorithm caching.
   // (Intentionally left as no-op.)
 }
