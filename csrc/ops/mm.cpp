@@ -10,7 +10,33 @@
 namespace torch_vulkan {
 namespace ops {
 
+
+// Helper: get existing Kompute tensor from a Vulkan PyTorch tensor (no copy!)
+static std::shared_ptr<kp::TensorT<float>> get_kp_tensor(const at::Tensor& t) {
+  auto& alloc = VulkanAllocator::instance();
+  return alloc.get_kompute_tensor(t.data_ptr());
+}
+
+// Helper: sync a Vulkan tensor's host data to device
+static void sync_to_device(std::shared_ptr<kp::TensorT<float>> t) {
+  auto& ctx = VulkanContext::instance();
+  auto& mgr = ctx.manager();
+  auto seq = mgr.sequence();
+  seq->record<kp::OpTensorSyncDevice>({t});
+  seq->eval();
+}
+
+// Helper: sync a Vulkan tensor's device data back to host
+static void sync_to_local(std::shared_ptr<kp::TensorT<float>> t) {
+  auto& ctx = VulkanContext::instance();
+  auto& mgr = ctx.manager();
+  auto seq = mgr.sequence();
+  seq->record<kp::OpTensorSyncLocal>({t});
+  seq->eval();
+}
+
 // Helper: run a 1D elementwise shader (3 buffers: a, b, out)
+// Uses persistent Kompute tensors from allocator — no per-call allocation
 static at::Tensor elementwise_binary(
     const at::Tensor& self, const at::Tensor& other,
     const std::string& shader_name,
@@ -24,13 +50,17 @@ static at::Tensor elementwise_binary(
   auto& ctx = VulkanContext::instance();
   auto& mgr = ctx.manager();
 
-  std::vector<float> a_data(self_c.data_ptr<float>(), self_c.data_ptr<float>() + n);
-  std::vector<float> b_data(other_c.data_ptr<float>(), other_c.data_ptr<float>() + n);
-  std::vector<float> c_data(n, 0.0f);
+  // Get existing Kompute tensors if on Vulkan, else create temp
+  bool a_on_vk = self_c.device().type() == c10::DeviceType::PrivateUse1;
+  bool b_on_vk = other_c.device().type() == c10::DeviceType::PrivateUse1;
 
-  auto tensor_a = mgr.tensor(a_data);
-  auto tensor_b = mgr.tensor(b_data);
-  auto tensor_c = mgr.tensor(c_data);
+  auto tensor_a = a_on_vk ? get_kp_tensor(self_c)
+      : mgr.tensor(std::vector<float>(self_c.data_ptr<float>(), self_c.data_ptr<float>() + n));
+  auto tensor_b = b_on_vk ? get_kp_tensor(other_c)
+      : mgr.tensor(std::vector<float>(other_c.data_ptr<float>(), other_c.data_ptr<float>() + n));
+
+  auto output = at::empty(self.sizes(), self.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
+  auto tensor_c = get_kp_tensor(output);
 
   auto spirv = ctx.load_shader(shader_name);
   uint32_t wg = (n + 255) / 256;
@@ -45,12 +75,11 @@ static at::Tensor elementwise_binary(
   seq->record<kp::OpTensorSyncLocal>({tensor_c});
   seq->eval();
 
-  auto output = at::empty(self.sizes(), self.options());
-  std::memcpy(output.data_ptr(), tensor_c->data(), n * sizeof(float));
   return output;
 }
 
 // Helper: run a 1D elementwise shader (2 buffers: in, out)
+// Uses persistent Kompute tensors — no per-call allocation
 static at::Tensor elementwise_unary(
     const at::Tensor& self, const std::string& shader_name,
     std::vector<uint32_t> push_constants) {
@@ -61,11 +90,12 @@ static at::Tensor elementwise_unary(
   auto& ctx = VulkanContext::instance();
   auto& mgr = ctx.manager();
 
-  std::vector<float> in_data(self_c.data_ptr<float>(), self_c.data_ptr<float>() + n);
-  std::vector<float> out_data(n, 0.0f);
+  bool on_vk = self_c.device().type() == c10::DeviceType::PrivateUse1;
+  auto tensor_in = on_vk ? get_kp_tensor(self_c)
+      : mgr.tensor(std::vector<float>(self_c.data_ptr<float>(), self_c.data_ptr<float>() + n));
 
-  auto tensor_in = mgr.tensor(in_data);
-  auto tensor_out = mgr.tensor(out_data);
+  auto output = at::empty(self.sizes(), self.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
+  auto tensor_out = get_kp_tensor(output);
 
   auto spirv = ctx.load_shader(shader_name);
   uint32_t wg = (n + 255) / 256;
@@ -80,8 +110,6 @@ static at::Tensor elementwise_unary(
   seq->record<kp::OpTensorSyncLocal>({tensor_out});
   seq->eval();
 
-  auto output = at::empty(self.sizes(), self.options());
-  std::memcpy(output.data_ptr(), tensor_out->data(), n * sizeof(float));
   return output;
 }
 
@@ -89,45 +117,42 @@ static at::Tensor elementwise_unary(
 // Forward declarations
 static at::Tensor mul_scalar(const at::Tensor& self, const at::Scalar& other);
 
-// aten::mm — matrix multiplication via matmul.spv
+// aten::mm — general matmul via matmul_general.spv
+// No padding, no temp allocations — uses persistent allocator tensors
 at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
   TORCH_CHECK(self.dim() == 2 && mat2.dim() == 2, "mm: inputs must be 2D");
   TORCH_CHECK(self.size(1) == mat2.size(0), "mm: dimension mismatch");
   TORCH_CHECK(self.dtype() == at::kFloat, "mm: only float32 for now");
 
   int64_t M = self.size(0), K = self.size(1), N = mat2.size(1);
-  int64_t dim = std::max({M, K, N});
 
   auto& ctx = VulkanContext::instance();
   auto& mgr = ctx.manager();
   auto self_c = self.contiguous();
   auto mat2_c = mat2.contiguous();
 
-  std::vector<float> a_data(dim * dim, 0.0f);
-  std::vector<float> b_data(dim * dim, 0.0f);
-  std::vector<float> c_data(dim * dim, 0.0f);
+  // Get or create Kompute tensors
+  bool a_on_vk = self_c.device().type() == c10::DeviceType::PrivateUse1;
+  bool b_on_vk = mat2_c.device().type() == c10::DeviceType::PrivateUse1;
 
-  const float* a_ptr = self_c.data_ptr<float>();
-  const float* b_ptr = mat2_c.data_ptr<float>();
-  for (int64_t i = 0; i < M; i++)
-    for (int64_t j = 0; j < K; j++)
-      a_data[i * dim + j] = a_ptr[i * K + j];
-  for (int64_t i = 0; i < K; i++)
-    for (int64_t j = 0; j < N; j++)
-      b_data[i * dim + j] = b_ptr[i * N + j];
+  auto tensor_a = a_on_vk ? get_kp_tensor(self_c)
+      : mgr.tensor(std::vector<float>(self_c.data_ptr<float>(), self_c.data_ptr<float>() + M * K));
+  auto tensor_b = b_on_vk ? get_kp_tensor(mat2_c)
+      : mgr.tensor(std::vector<float>(mat2_c.data_ptr<float>(), mat2_c.data_ptr<float>() + K * N));
 
-  auto tensor_a = mgr.tensor(a_data);
-  auto tensor_b = mgr.tensor(b_data);
-  auto tensor_c = mgr.tensor(c_data);
+  auto output = at::empty({M, N}, self.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
+  auto tensor_c = get_kp_tensor(output);
 
-  auto spirv = ctx.load_shader("matmul");
-  uint32_t n_val = static_cast<uint32_t>(dim);
-  uint32_t wg_x = (dim + 15) / 16, wg_y = (dim + 15) / 16;
+  auto spirv = ctx.load_shader("matmul_general");
+  uint32_t m_val = static_cast<uint32_t>(M);
+  uint32_t k_val = static_cast<uint32_t>(K);
+  uint32_t n_val = static_cast<uint32_t>(N);
+  uint32_t wg_x = (N + 15) / 16, wg_y = (M + 15) / 16;
 
   auto algorithm = mgr.algorithm(
       {tensor_a, tensor_b, tensor_c}, spirv,
       kp::Workgroup({wg_x, wg_y, 1}), {},
-      std::vector<uint32_t>{n_val});
+      std::vector<uint32_t>{m_val, k_val, n_val});
 
   auto seq = mgr.sequence();
   seq->record<kp::OpTensorSyncDevice>({tensor_a, tensor_b});
@@ -135,12 +160,6 @@ at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
   seq->record<kp::OpTensorSyncLocal>({tensor_c});
   seq->eval();
 
-  auto output = at::empty({M, N}, self.options());
-  float* out_ptr = output.data_ptr<float>();
-  const float* c_ptr = tensor_c->data();
-  for (int64_t i = 0; i < M; i++)
-    for (int64_t j = 0; j < N; j++)
-      out_ptr[i * N + j] = c_ptr[i * dim + j];
   return output;
 }
 
