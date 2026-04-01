@@ -680,6 +680,70 @@ at::Tensor vulkan_t(const at::Tensor& self) {
   return output;
 }
 
+
+// Q4 quantized matmul: A (float32) @ B_packed (Q4) with scales
+// B_packed: uint8 array, 2 values per byte, stored as uint32 words
+// B_scales: float32 [K/32, N], one scale per block of 32
+static at::Tensor mm_q4(const at::Tensor& input, const at::Tensor& weight_packed,
+                         const at::Tensor& weight_scales) {
+  auto input_c = input.contiguous();
+  int64_t M = input_c.size(0);
+  int64_t K = input_c.size(1);
+  int64_t N = weight_scales.size(1);
+
+  auto& ctx = VulkanContext::instance();
+  auto& mgr = ctx.manager();
+
+  // Input: float32 [M, K]
+  bool a_on_vk = input_c.device().type() == c10::DeviceType::PrivateUse1;
+  auto tensor_a = a_on_vk ? get_kp_tensor(input_c)
+      : mgr.tensor(std::vector<float>(input_c.data_ptr<float>(), input_c.data_ptr<float>() + M * K));
+
+  // Weight packed: uint32 words (K*N/8 uint32s)
+  auto wp_c = weight_packed.contiguous();
+  bool wp_on_vk = wp_c.device().type() == c10::DeviceType::PrivateUse1;
+  std::shared_ptr<kp::TensorT<float>> tensor_b;
+  if (wp_on_vk) {
+    tensor_b = get_kp_tensor(wp_c);
+  } else {
+    // Reinterpret packed uint8/uint32 data as float for Kompute
+    size_t packed_floats = (K * N / 8 + 3) / 4 * 4;  // round up
+    std::vector<float> packed_data(packed_floats, 0.0f);
+    std::memcpy(packed_data.data(), wp_c.data_ptr(), wp_c.numel() * wp_c.element_size());
+    tensor_b = mgr.tensor(packed_data);
+  }
+
+  // Scales: float32 [K/32, N]
+  auto sc_c = weight_scales.contiguous();
+  bool sc_on_vk = sc_c.device().type() == c10::DeviceType::PrivateUse1;
+  auto tensor_scales = sc_on_vk ? get_kp_tensor(sc_c)
+      : mgr.tensor(std::vector<float>(sc_c.data_ptr<float>(), sc_c.data_ptr<float>() + sc_c.numel()));
+
+  // Output: float32 [M, N]
+  auto output = at::empty({M, N}, input.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
+  auto tensor_c = get_kp_tensor(output);
+
+  auto spirv = ctx.load_shader("matmul_q4");
+  uint32_t m_val = static_cast<uint32_t>(M);
+  uint32_t k_val = static_cast<uint32_t>(K);
+  uint32_t n_val = static_cast<uint32_t>(N);
+  uint32_t wg_x = (N + 15) / 16;
+  uint32_t wg_y = (M + 15) / 16;
+
+  auto algorithm = ctx.get_or_create_algorithm(
+      "matmul_q4", {tensor_a, tensor_b, tensor_scales, tensor_c},
+      kp::Workgroup({wg_x, wg_y, 1}),
+      std::vector<uint32_t>{m_val, k_val, n_val});
+
+  auto seq = mgr.sequence();
+  seq->record<kp::OpTensorSyncDevice>({tensor_a, tensor_b, tensor_scales});
+  seq->record<kp::OpAlgoDispatch>(algorithm);
+  seq->record<kp::OpTensorSyncLocal>({tensor_c});
+  seq->eval();
+
+  return output;
+}
+
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   at::native::cpu_fallback(op, stack);
 }
@@ -710,3 +774,14 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
 
 } // namespace ops
 } // namespace torch_vulkan
+
+// Custom ops (outside namespace for TORCH_LIBRARY)
+static at::Tensor mm_q4_dispatch(const at::Tensor& input, const at::Tensor& weight_packed,
+                                  const at::Tensor& weight_scales) {
+  return torch_vulkan::ops::mm_q4(input, weight_packed, weight_scales);
+}
+
+TORCH_LIBRARY(torch_vulkan_ops, m) {
+  m.def("mm_q4(Tensor input, Tensor weight_packed, Tensor weight_scales) -> Tensor");
+  m.impl("mm_q4", &mm_q4_dispatch);
+}
