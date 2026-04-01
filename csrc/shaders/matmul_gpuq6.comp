@@ -1,0 +1,52 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// GPU-native Q6 matmul — repacked layout.
+// Per block (320B per 256 elements):
+//   f32[16] scales (offset 0)   — pre-decoded: d * int8(scale), 16 per block
+//   u8[256] quants (offset 64)  — 6-bit unsigned values (0-63), packed 4 per uint32
+//
+// Inner loop: one u32 load for scale, one u32 load for 4 quant bytes,
+// extract byte, subtract 32 (signed offset), multiply by scale.
+// Dispatch: [N, 1, 1] workgroups of 64 (wave64).
+
+#define WG_SIZE 64
+#define BLOCK_ELEMS 256
+#define BLOCK_U32S 80  // 320 bytes / 4
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufW { uint w_data[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; } params;
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint bpr = params.K / BLOCK_ELEMS;
+    uint row_off = n * bpr * BLOCK_U32S;
+    float partial = 0.0;
+
+    for (uint k = tid; k < params.K; k += WG_SIZE) {
+        uint blk = k / BLOCK_ELEMS;
+        uint e = k % BLOCK_ELEMS;
+        uint bo = row_off + blk * BLOCK_U32S;
+
+        // Q6_K has 16 scales (one per 16 elements)
+        uint sc_idx = e / 16u;
+        float sc = uintBitsToFloat(w_data[bo + sc_idx]);  // scales at offset 0
+
+        // Quant: u8 at offset 64B = 16 u32s, 4 per uint32
+        uint word = w_data[bo + 16u + e / 4u];
+        uint qi = (word >> ((e % 4u) * 8u)) & 0x3Fu;  // 6-bit value, 0-63
+
+        float w = float(int(qi) - 32) * sc;  // signed: qi - 32
+        partial += a[k] * w;
+    }
+
+    float sum = subgroupAdd(partial);
+    if (tid == 0u) c[n] = sum;
+}
