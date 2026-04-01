@@ -224,6 +224,108 @@ at::Tensor empty_memory_format(
   return tensor;
 }
 
+// aten::_softmax — row-wise softmax via softmax.spv
+at::Tensor vulkan_softmax(const at::Tensor& self, int64_t dim, bool half_to_float) {
+  TORCH_CHECK(self.dtype() == at::kFloat, "softmax: only float32");
+  auto self_c = self.contiguous();
+
+  // Flatten to 2D: [batch, row_size]
+  int64_t row_size = self_c.size(dim);
+  int64_t num_rows = self_c.numel() / row_size;
+
+  auto& ctx = VulkanContext::instance();
+  auto& mgr = ctx.manager();
+
+  int64_t n = self_c.numel();
+  std::vector<float> in_data(self_c.data_ptr<float>(), self_c.data_ptr<float>() + n);
+  std::vector<float> out_data(n, 0.0f);
+
+  auto tensor_in = mgr.tensor(in_data);
+  auto tensor_out = mgr.tensor(out_data);
+
+  auto spirv = ctx.load_shader("softmax");
+  uint32_t nr = static_cast<uint32_t>(num_rows);
+  uint32_t rs = static_cast<uint32_t>(row_size);
+
+  // One workgroup per row
+  auto algorithm = mgr.algorithm(
+      {tensor_in, tensor_out}, spirv,
+      kp::Workgroup({nr, 1, 1}), {},
+      std::vector<uint32_t>{nr, rs});
+
+  auto seq = mgr.sequence();
+  seq->record<kp::OpTensorSyncDevice>({tensor_in});
+  seq->record<kp::OpAlgoDispatch>(algorithm);
+  seq->record<kp::OpTensorSyncLocal>({tensor_out});
+  seq->eval();
+
+  auto output = at::empty(self.sizes(), self.options());
+  std::memcpy(output.data_ptr(), tensor_out->data(), n * sizeof(float));
+  return output;
+}
+
+// aten::native_layer_norm — layer normalization via layer_norm.spv
+std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_layer_norm(
+    const at::Tensor& input,
+    at::IntArrayRef normalized_shape,
+    const std::optional<at::Tensor>& weight_opt,
+    const std::optional<at::Tensor>& bias_opt,
+    double eps) {
+
+  TORCH_CHECK(input.dtype() == at::kFloat, "layer_norm: only float32");
+  auto input_c = input.contiguous();
+
+  int64_t row_size = 1;
+  for (auto s : normalized_shape) row_size *= s;
+  int64_t num_rows = input_c.numel() / row_size;
+
+  auto& ctx = VulkanContext::instance();
+  auto& mgr = ctx.manager();
+
+  int64_t n = input_c.numel();
+  std::vector<float> in_data(input_c.data_ptr<float>(), input_c.data_ptr<float>() + n);
+  std::vector<float> out_data(n, 0.0f);
+
+  // Weight and bias (default to 1.0 and 0.0)
+  std::vector<float> w_data(row_size, 1.0f);
+  std::vector<float> b_data(row_size, 0.0f);
+  if (weight_opt.has_value() && weight_opt->defined()) {
+    auto w = weight_opt->contiguous();
+    std::memcpy(w_data.data(), w.data_ptr<float>(), row_size * sizeof(float));
+  }
+  if (bias_opt.has_value() && bias_opt->defined()) {
+    auto b = bias_opt->contiguous();
+    std::memcpy(b_data.data(), b.data_ptr<float>(), row_size * sizeof(float));
+  }
+
+  auto tensor_in = mgr.tensor(in_data);
+  auto tensor_w = mgr.tensor(w_data);
+  auto tensor_b = mgr.tensor(b_data);
+  auto tensor_out = mgr.tensor(out_data);
+
+  auto spirv = ctx.load_shader("layer_norm");
+  uint32_t nr = static_cast<uint32_t>(num_rows);
+  uint32_t rs = static_cast<uint32_t>(row_size);
+
+  auto algorithm = mgr.algorithm(
+      {tensor_in, tensor_w, tensor_b, tensor_out}, spirv,
+      kp::Workgroup({nr, 1, 1}), {},
+      std::vector<uint32_t>{nr, rs});
+
+  auto seq = mgr.sequence();
+  seq->record<kp::OpTensorSyncDevice>({tensor_in, tensor_w, tensor_b});
+  seq->record<kp::OpAlgoDispatch>(algorithm);
+  seq->record<kp::OpTensorSyncLocal>({tensor_out});
+  seq->eval();
+
+  auto output = at::empty(input.sizes(), input.options());
+  std::memcpy(output.data_ptr(), tensor_out->data(), n * sizeof(float));
+
+  // Mean and rstd (not computed on GPU, return empty for now)
+  auto mean = at::empty({num_rows}, input.options());
+  auto rstd = at::empty({num_rows}, input.options());
+  return std::make_tuple(output, mean, rstd);
+}
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   at::native::cpu_fallback(op, stack);
 }
@@ -234,6 +336,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("mul.Tensor", &mul_tensor);
   m.impl("relu", &relu);
   m.impl("empty.memory_format", &empty_memory_format);
+  m.impl("_softmax", &vulkan_softmax);
+  m.impl("native_layer_norm", &vulkan_layer_norm);
   m.impl("_to_copy", &vulkan_to_copy);
   m.impl("copy_", &vulkan_copy_);
 }
