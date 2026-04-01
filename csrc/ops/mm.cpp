@@ -127,7 +127,7 @@ static at::Tensor elementwise_unary(
 static at::Tensor mul_scalar(const at::Tensor& self, const at::Scalar& other);
 
 
-// aten::mm via raw VulkanEngine — zero Kompute overhead
+// aten::mm via raw VulkanEngine — pooled buffers, zero per-call allocation
 static at::Tensor mm_raw(const at::Tensor& self, const at::Tensor& mat2) {
   int64_t M = self.size(0), K = self.size(1), N = mat2.size(1);
 
@@ -137,38 +137,36 @@ static at::Tensor mm_raw(const at::Tensor& self, const at::Tensor& mat2) {
   auto self_c = self.contiguous();
   auto mat2_c = mat2.contiguous();
 
-  // Create/reuse buffers (unified memory — host visible + coherent)
   VkDeviceSize a_size = M * K * sizeof(float);
   VkDeviceSize b_size = K * N * sizeof(float);
   VkDeviceSize c_size = M * N * sizeof(float);
 
-  void *a_ptr, *b_ptr, *c_ptr;
-  VkBuffer a_buf = engine.createBuffer(a_size, &a_ptr);
-  VkBuffer b_buf = engine.createBuffer(b_size, &b_ptr);
-  VkBuffer c_buf = engine.createBuffer(c_size, &c_ptr);
+  // Acquire from pool (no vkAllocateMemory after warmup)
+  auto a_buf = engine.acquireBuffer(a_size);
+  auto b_buf = engine.acquireBuffer(b_size);
+  auto c_buf = engine.acquireBuffer(c_size);
 
-  // Copy input data (host-coherent, no sync needed on unified memory)
-  std::memcpy(a_ptr, self_c.data_ptr<float>(), a_size);
-  std::memcpy(b_ptr, mat2_c.data_ptr<float>(), b_size);
+  // memcpy only (host-coherent unified memory)
+  std::memcpy(a_buf.mapped, self_c.data_ptr<float>(), a_size);
+  std::memcpy(b_buf.mapped, mat2_c.data_ptr<float>(), b_size);
 
-  // Push constants: M, K, N
   uint32_t push[3] = {(uint32_t)M, (uint32_t)K, (uint32_t)N};
   uint32_t wg_x = (N + 15) / 16;
   uint32_t wg_y = (M + 15) / 16;
 
   engine.dispatch(pipeline,
-    {a_buf, b_buf, c_buf},
+    {a_buf.buffer, b_buf.buffer, c_buf.buffer},
     {a_size, b_size, c_size},
     push, sizeof(push),
     wg_x, wg_y, 1);
 
-  // Read result directly from mapped memory
   auto output = at::empty({M, N}, self.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
-  std::memcpy(output.data_ptr<float>(), c_ptr, c_size);
+  std::memcpy(output.data_ptr<float>(), c_buf.mapped, c_size);
 
-  engine.destroyBuffer(a_buf);
-  engine.destroyBuffer(b_buf);
-  engine.destroyBuffer(c_buf);
+  // Return to pool (not destroyed, reused next call)
+  engine.releaseBuffer(a_buf);
+  engine.releaseBuffer(b_buf);
+  engine.releaseBuffer(c_buf);
 
   return output;
 }

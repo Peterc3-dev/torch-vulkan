@@ -172,6 +172,40 @@ void VulkanEngine::destroyBuffer(VkBuffer buffer) {
     }
 }
 
+
+static VkDeviceSize roundUpPow2(VkDeviceSize size) {
+    VkDeviceSize p = 1;
+    while (p < size) p <<= 1;
+    return p;
+}
+
+VulkanEngine::PooledBuffer VulkanEngine::acquireBuffer(VkDeviceSize size) {
+    VkDeviceSize bucket = roundUpPow2(std::max(size, (VkDeviceSize)256));
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& pool = bufferPool_[bucket];
+        if (!pool.empty()) {
+            auto buf = pool.back();
+            pool.pop_back();
+            return buf;
+        }
+    }
+
+    // No pooled buffer available — create new one at bucket size
+    void* mapped = nullptr;
+    VkBuffer buffer = createBuffer(bucket, &mapped);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto mem = bufferMemory_[buffer];
+    return PooledBuffer{buffer, mem, mapped, bucket};
+}
+
+void VulkanEngine::releaseBuffer(PooledBuffer& buf) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    bufferPool_[buf.capacity].push_back(buf);
+}
+
 std::vector<uint32_t> VulkanEngine::loadShader(const std::string& name) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = shaderCache_.find(name);

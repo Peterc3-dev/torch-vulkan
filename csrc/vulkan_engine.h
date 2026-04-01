@@ -50,7 +50,17 @@ public:
         uint32_t groupCountY,
         uint32_t groupCountZ);
 
-    // Allocate a device-local + host-visible buffer (unified memory)
+    // Buffer pool: get a buffer of at least `size` bytes, reuse from pool
+    struct PooledBuffer {
+        VkBuffer buffer;
+        VkDeviceMemory memory;
+        void* mapped;
+        VkDeviceSize capacity;
+    };
+    PooledBuffer acquireBuffer(VkDeviceSize size);
+    void releaseBuffer(PooledBuffer& buf);
+
+    // Legacy (non-pooled) — kept for compatibility
     VkBuffer createBuffer(VkDeviceSize size, void** mappedPtr);
     void destroyBuffer(VkBuffer buffer);
 
@@ -80,6 +90,8 @@ private:
     std::unordered_map<std::string, std::vector<uint32_t>> shaderCache_;
     std::unordered_map<std::string, CachedPipeline> pipelineCache_;
     std::unordered_map<VkBuffer, VkDeviceMemory> bufferMemory_;
+    // Buffer pool: buckets by size (rounded up to power of 2)
+    std::unordered_map<VkDeviceSize, std::vector<PooledBuffer>> bufferPool_;
     std::mutex mutex_;
 };
 
