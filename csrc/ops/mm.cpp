@@ -326,6 +326,88 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_layer_norm(
   auto rstd = at::empty({num_rows}, input.options());
   return std::make_tuple(output, mean, rstd);
 }
+
+// aten::gelu — Gaussian Error Linear Unit via gelu.spv
+at::Tensor vulkan_gelu(const at::Tensor& self, c10::string_view approximate) {
+  uint32_t n = static_cast<uint32_t>(self.numel());
+  return elementwise_unary(self, "gelu", {n});
+}
+
+// aten::embedding — lookup table via embedding.spv
+at::Tensor vulkan_embedding(
+    const at::Tensor& weight,
+    const at::Tensor& indices,
+    int64_t padding_idx,
+    bool scale_grad_by_freq,
+    bool sparse) {
+
+  TORCH_CHECK(weight.dtype() == at::kFloat, "embedding: only float32 weight");
+  auto weight_c = weight.contiguous();
+  auto indices_c = indices.contiguous().to(at::kFloat);  // pass as float buffer
+
+  int64_t num_indices = indices_c.numel();
+  int64_t embedding_dim = weight.size(1);
+  int64_t total = num_indices * embedding_dim;
+
+  auto& ctx = VulkanContext::instance();
+  auto& mgr = ctx.manager();
+
+  std::vector<float> w_data(weight_c.data_ptr<float>(),
+      weight_c.data_ptr<float>() + weight_c.numel());
+  std::vector<float> idx_data(indices_c.data_ptr<float>(),
+      indices_c.data_ptr<float>() + num_indices);
+  std::vector<float> out_data(total, 0.0f);
+
+  auto tensor_w = mgr.tensor(w_data);
+  auto tensor_idx = mgr.tensor(idx_data);
+  auto tensor_out = mgr.tensor(out_data);
+
+  auto spirv = ctx.load_shader("embedding");
+  uint32_t wg = (total + 255) / 256;
+  uint32_t ni = static_cast<uint32_t>(num_indices);
+  uint32_t ed = static_cast<uint32_t>(embedding_dim);
+
+  auto algorithm = mgr.algorithm(
+      {tensor_w, tensor_idx, tensor_out}, spirv,
+      kp::Workgroup({wg, 1, 1}), {},
+      std::vector<uint32_t>{ni, ed});
+
+  auto seq = mgr.sequence();
+  seq->record<kp::OpTensorSyncDevice>({tensor_w, tensor_idx});
+  seq->record<kp::OpAlgoDispatch>(algorithm);
+  seq->record<kp::OpTensorSyncLocal>({tensor_out});
+  seq->eval();
+
+  auto out_sizes = indices.sizes().vec();
+  out_sizes.push_back(embedding_dim);
+  auto output = at::empty(out_sizes, weight.options());
+  std::memcpy(output.data_ptr(), tensor_out->data(), total * sizeof(float));
+  return output;
+}
+
+// aten::addmm — fused bias + matmul: out = beta*self + alpha*(mat1 @ mat2)
+at::Tensor vulkan_addmm(
+    const at::Tensor& self,
+    const at::Tensor& mat1,
+    const at::Tensor& mat2,
+    const at::Scalar& beta,
+    const at::Scalar& alpha) {
+
+  auto product = torch_vulkan::ops::mm(mat1, mat2);
+
+  if (alpha.toFloat() != 1.0f) {
+    auto alpha_t = at::full({1}, alpha.toFloat(), product.options());
+    product = mul_tensor(product, alpha_t.expand_as(product).contiguous());
+  }
+
+  auto bias = self;
+  if (self.dim() == 1) {
+    bias = self.unsqueeze(0).expand_as(product).contiguous();
+  }
+
+  return add_tensor(bias, product, beta);
+}
+
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   at::native::cpu_fallback(op, stack);
 }
@@ -340,6 +422,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("native_layer_norm", &vulkan_layer_norm);
   m.impl("_to_copy", &vulkan_to_copy);
   m.impl("copy_", &vulkan_copy_);
+  m.impl("gelu", &vulkan_gelu);
+  m.impl("embedding", &vulkan_embedding);
+  m.impl("addmm", &vulkan_addmm);
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
