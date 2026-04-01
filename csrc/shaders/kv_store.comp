@@ -1,28 +1,40 @@
 #version 450
-// Copy K and V segments from QKV buffer into KV cache at position `pos`.
-// QKV layout: [Q: n_heads*head_dim | K: n_kv_heads*head_dim | V: n_kv_heads*head_dim]
-// K_cache/V_cache layout: [pos * n_kv_heads * head_dim + ...]
+// Copy K and V from f32 QKV buffer into f16 KV cache at position `pos`.
+// Each thread packs 2 adjacent f32 values into one uint32 (two f16).
+// No read-modify-write races — each thread owns a full uint32.
 //
 // Push: pos, q_len (= n_heads*head_dim), kv_len (= n_kv_heads*head_dim)
-// Dispatch: [ceil(kv_len/256), 1, 1]
+// Dispatch: [ceil(kv_len/2/256), 1, 1]  — note: /2 because each thread does 2 elements
 
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) buffer BufQKV { float qkv[]; };
-layout(set = 0, binding = 1) buffer BufK   { float k_cache[]; };
-layout(set = 0, binding = 2) buffer BufV   { float v_cache[]; };
+layout(set = 0, binding = 1) buffer BufK   { uint k_cache[]; };
+layout(set = 0, binding = 2) buffer BufV   { uint v_cache[]; };
 
 layout(push_constant) uniform PushConstants {
     uint pos;
-    uint q_len;    // N_HEADS * HEAD_DIM
-    uint kv_len;   // N_KV_HEADS * HEAD_DIM
+    uint q_len;
+    uint kv_len;
 } params;
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= params.kv_len) return;
+    uint pair_idx = gl_GlobalInvocationID.x;
+    uint half_len = params.kv_len / 2u;
+    if (pair_idx >= half_len) return;
 
-    uint cache_off = params.pos * params.kv_len + i;
-    k_cache[cache_off] = qkv[params.q_len + i];
-    v_cache[cache_off] = qkv[params.q_len + params.kv_len + i];
+    uint e0 = pair_idx * 2u;
+    uint e1 = e0 + 1u;
+
+    uint cache_base = params.pos * params.kv_len;
+
+    // Read 2 K values, pack as f16 pair
+    float k0 = qkv[params.q_len + e0];
+    float k1 = qkv[params.q_len + e1];
+    k_cache[(cache_base + e0) / 2u] = packHalf2x16(vec2(k0, k1));
+
+    // Read 2 V values, pack as f16 pair
+    float v0 = qkv[params.q_len + params.kv_len + e0];
+    float v1 = qkv[params.q_len + params.kv_len + e1];
+    v_cache[(cache_base + e0) / 2u] = packHalf2x16(vec2(v0, v1));
 }
