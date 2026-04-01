@@ -86,6 +86,8 @@ static at::Tensor elementwise_unary(
 }
 
 // ---- Operators ----
+// Forward declarations
+static at::Tensor mul_scalar(const at::Tensor& self, const at::Scalar& other);
 
 // aten::mm — matrix multiplication via matmul.spv
 at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
@@ -142,17 +144,32 @@ at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
   return output;
 }
 
-// aten::add.Tensor — elementwise add with alpha scaling
+// aten::add.Tensor — elementwise add with alpha scaling (with broadcast)
 at::Tensor add_tensor(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha) {
-  uint32_t n = static_cast<uint32_t>(self.numel());
+  auto self_c = self.contiguous();
+  auto other_c = other.contiguous();
+  // Broadcast scalar-like tensors
+  if (other_c.numel() == 1 && self_c.numel() > 1) {
+    other_c = other_c.expand_as(self_c).contiguous();
+  } else if (self_c.numel() == 1 && other_c.numel() > 1) {
+    self_c = self_c.expand_as(other_c).contiguous();
+  }
+  uint32_t n = static_cast<uint32_t>(self_c.numel());
   float alpha_f = alpha.toFloat();
   uint32_t alpha_bits;
   std::memcpy(&alpha_bits, &alpha_f, sizeof(uint32_t));
-  return elementwise_binary(self, other, "add", {n, alpha_bits});
+  return elementwise_binary(self_c, other_c, "add", {n, alpha_bits});
 }
 
-// aten::mul.Tensor — elementwise multiply
+// aten::mul.Tensor — elementwise multiply (with broadcast for scalars)
 at::Tensor mul_tensor(const at::Tensor& self, const at::Tensor& other) {
+  // Handle scalar-as-tensor (0-dim or 1-element)
+  if (other.numel() == 1) {
+    return mul_scalar(self, other.item());
+  }
+  if (self.numel() == 1) {
+    return mul_scalar(other, self.item());
+  }
   uint32_t n = static_cast<uint32_t>(self.numel());
   return elementwise_binary(self, other, "mul", {n});
 }
@@ -408,6 +425,177 @@ at::Tensor vulkan_addmm(
   return add_tensor(bias, product, beta);
 }
 
+
+// aten::mul.Scalar — elementwise scalar multiply via scalar_mul.spv
+at::Tensor mul_scalar(const at::Tensor& self, const at::Scalar& other) {
+  auto self_c = self.contiguous();
+  int64_t n = self_c.numel();
+  float scalar = other.toFloat();
+
+  auto& ctx = VulkanContext::instance();
+  auto& mgr = ctx.manager();
+
+  std::vector<float> in_data(self_c.data_ptr<float>(), self_c.data_ptr<float>() + n);
+  std::vector<float> out_data(n, 0.0f);
+
+  auto tensor_in = mgr.tensor(in_data);
+  auto tensor_out = mgr.tensor(out_data);
+
+  auto spirv = ctx.load_shader("scalar_mul");
+  uint32_t wg = (n + 255) / 256;
+  uint32_t n_val = static_cast<uint32_t>(n);
+  uint32_t scalar_bits;
+  std::memcpy(&scalar_bits, &scalar, sizeof(uint32_t));
+
+  auto algorithm = mgr.algorithm(
+      {tensor_in, tensor_out}, spirv,
+      kp::Workgroup({wg, 1, 1}), {},
+      std::vector<uint32_t>{n_val, scalar_bits});
+
+  auto seq = mgr.sequence();
+  seq->record<kp::OpTensorSyncDevice>({tensor_in});
+  seq->record<kp::OpAlgoDispatch>(algorithm);
+  seq->record<kp::OpTensorSyncLocal>({tensor_out});
+  seq->eval();
+
+  auto output = at::empty(self.sizes(), self.options());
+  std::memcpy(output.data_ptr(), tensor_out->data(), n * sizeof(float));
+  return output;
+}
+
+// aten::div.Tensor — elementwise divide (a / b)
+at::Tensor div_tensor(const at::Tensor& self, const at::Tensor& other) {
+  // For scalar-like divisors, use scalar path
+  if (other.numel() == 1) {
+    float divisor = other.item<float>();
+    return mul_scalar(self, at::Scalar(1.0f / divisor));
+  }
+  // General case: compute reciprocal and multiply
+  TORCH_CHECK(false, "div.Tensor: only scalar-like divisor supported for now");
+}
+
+// Fused scaled dot-product attention via attention.spv
+// Q, K, V: [seq_len, head_dim] (single head) or iterated over heads
+at::Tensor vulkan_scaled_dot_product_attention(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const std::optional<at::Tensor>& attn_mask,
+    double dropout_p,
+    bool is_causal,
+    std::optional<double> scale,
+    bool enable_gqa) {
+
+  // Handle shapes: [B, H, S, D] or [S, D]
+  auto q = query.contiguous();
+  auto k = key.contiguous();
+  auto v = value.contiguous();
+
+  int64_t seq_len, head_dim;
+  bool batched = q.dim() == 4;
+  int64_t batch = 1, heads = 1;
+
+  if (batched) {
+    batch = q.size(0);
+    heads = q.size(1);
+    seq_len = q.size(2);
+    head_dim = q.size(3);
+  } else if (q.dim() == 3) {
+    batch = q.size(0);
+    seq_len = q.size(1);
+    head_dim = q.size(2);
+  } else {
+    seq_len = q.size(0);
+    head_dim = q.size(1);
+  }
+
+  auto& ctx = VulkanContext::instance();
+  auto& mgr = ctx.manager();
+  auto spirv = ctx.load_shader("attention");
+
+  // Allocate output same shape as query
+  auto output = at::empty(q.sizes(), q.options());
+
+  int64_t head_elements = seq_len * head_dim;
+
+  // Iterate over batch and heads (shader handles single [S, D] attention)
+  for (int64_t b = 0; b < batch; b++) {
+    for (int64_t h = 0; h < heads; h++) {
+      int64_t offset = (b * heads + h) * head_elements;
+      const float* q_ptr = q.data_ptr<float>() + offset;
+      const float* k_ptr = k.data_ptr<float>() + offset;
+      const float* v_ptr = v.data_ptr<float>() + offset;
+      float* o_ptr = output.data_ptr<float>() + offset;
+
+      std::vector<float> q_data(q_ptr, q_ptr + head_elements);
+      std::vector<float> k_data(k_ptr, k_ptr + head_elements);
+      std::vector<float> v_data(v_ptr, v_ptr + head_elements);
+      std::vector<float> o_data(head_elements, 0.0f);
+
+      auto tq = mgr.tensor(q_data);
+      auto tk = mgr.tensor(k_data);
+      auto tv = mgr.tensor(v_data);
+      auto to = mgr.tensor(o_data);
+
+      uint32_t sl = static_cast<uint32_t>(seq_len);
+      uint32_t hd = static_cast<uint32_t>(head_dim);
+
+      auto algorithm = mgr.algorithm(
+          {tq, tk, tv, to}, spirv,
+          kp::Workgroup({sl, 1, 1}), {},
+          std::vector<uint32_t>{sl, hd});
+
+      auto seq = mgr.sequence();
+      seq->record<kp::OpTensorSyncDevice>({tq, tk, tv});
+      seq->record<kp::OpAlgoDispatch>(algorithm);
+      seq->record<kp::OpTensorSyncLocal>({to});
+      seq->eval();
+
+      std::memcpy(o_ptr, to->data(), head_elements * sizeof(float));
+    }
+  }
+
+  return output;
+}
+
+// aten::reshape / view — metadata reshape, copy if non-contiguous
+at::Tensor vulkan_reshape(const at::Tensor& self, at::IntArrayRef shape) {
+  auto self_c = self.contiguous();
+  // Compute actual shape (resolve -1)
+  int64_t total = self_c.numel();
+  std::vector<int64_t> new_shape(shape.begin(), shape.end());
+  int64_t neg_idx = -1;
+  int64_t known = 1;
+  for (int64_t i = 0; i < (int64_t)new_shape.size(); i++) {
+    if (new_shape[i] == -1) {
+      neg_idx = i;
+    } else {
+      known *= new_shape[i];
+    }
+  }
+  if (neg_idx >= 0) {
+    new_shape[neg_idx] = total / known;
+  }
+
+  auto output = at::empty(new_shape, self.options());
+  std::memcpy(output.data_ptr(), self_c.data_ptr(), total * self_c.element_size());
+  return output;
+}
+
+// aten::t — matrix transpose (2D only)
+at::Tensor vulkan_t(const at::Tensor& self) {
+  TORCH_CHECK(self.dim() == 2, "t: only 2D tensors");
+  auto self_c = self.contiguous();
+  int64_t rows = self_c.size(0), cols = self_c.size(1);
+  auto output = at::empty({cols, rows}, self.options());
+  const float* src = self_c.data_ptr<float>();
+  float* dst = output.data_ptr<float>();
+  for (int64_t i = 0; i < rows; i++)
+    for (int64_t j = 0; j < cols; j++)
+      dst[j * rows + i] = src[i * cols + j];
+  return output;
+}
+
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   at::native::cpu_fallback(op, stack);
 }
@@ -425,6 +613,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("gelu", &vulkan_gelu);
   m.impl("embedding", &vulkan_embedding);
   m.impl("addmm", &vulkan_addmm);
+  m.impl("mul.Scalar", &mul_scalar);
+  m.impl("div.Tensor", &div_tensor);
+  m.impl("scaled_dot_product_attention", &vulkan_scaled_dot_product_attention);
+  m.impl("reshape", &vulkan_reshape);
+  m.impl("t", &vulkan_t);
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
