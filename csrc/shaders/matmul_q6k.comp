@@ -1,0 +1,86 @@
+#version 450
+// Native Q6_K matmul — correct llama.cpp interleaved layout.
+// Q6_K: 210 bytes per 256 elements.
+// Layout: [128B ql][64B qh][16B scales][2B d]
+// Elements are interleaved in groups of 128, with 4 quads of 32.
+// Per group g (0,1), per l (0..31):
+//   quad 0: ql[g*64+l] low,  qh[g*32+l] bits 0-1, scale[g*8+0]
+//   quad 1: ql[g*64+l+32] low, qh[g*32+l] bits 2-3, scale[g*8+2]
+//   quad 2: ql[g*64+l] high, qh[g*32+l] bits 4-5, scale[g*8+4]
+//   quad 3: ql[g*64+l+32] high, qh[g*32+l] bits 6-7, scale[g*8+6]
+
+#define BLOCK_ELEMS 256
+#define Q6K_BLOCK_BYTES 210
+#define WG_SIZE 256
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { uint b_data[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint K;
+    uint N;
+} params;
+
+shared float sdata[WG_SIZE];
+
+uint read_byte(uint off) {
+    return (b_data[off >> 2] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+float fp16(uint off) {
+    return unpackHalf2x16(read_byte(off) | (read_byte(off + 1u) << 8u)).x;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint blocks_per_row = params.K / BLOCK_ELEMS;
+    uint row_off = n * blocks_per_row * Q6K_BLOCK_BYTES;
+
+    float partial = 0.0;
+
+    for (uint k = tid; k < params.K; k += WG_SIZE) {
+        uint blk = k / BLOCK_ELEMS;
+        uint pos = k % BLOCK_ELEMS;
+        uint boff = row_off + blk * Q6K_BLOCK_BYTES;
+
+        float d = fp16(boff + 208u);
+
+        uint g = pos / 128u;
+        uint pos_in_group = pos % 128u;
+        uint quad = pos_in_group / 32u;
+        uint l = pos_in_group % 32u;
+
+        // ql byte: offset depends on quad (0,2 use l; 1,3 use l+32)
+        uint ql_idx = g * 64u + l + ((quad & 1u) * 32u);
+        uint ql_byte = read_byte(boff + ql_idx);
+        uint ql_val = (quad < 2u) ? (ql_byte & 0x0Fu) : ((ql_byte >> 4u) & 0x0Fu);
+
+        // qh byte: same l for all quads, shift depends on quad
+        uint qh_byte = read_byte(boff + 128u + g * 32u + l);
+        uint qh_val = (qh_byte >> (quad * 2u)) & 0x03u;
+
+        // scale: signed int8 — l/16 selects between two scale halves per quad
+        uint sc_idx = g * 8u + quad * 2u + l / 16u;
+        int sc_raw = int(read_byte(boff + 192u + sc_idx));
+        float sc = d * float(sc_raw - ((sc_raw >= 128) ? 256 : 0));
+
+        // combine 6-bit value, signed
+        int q = int(ql_val | (qh_val << 4u)) - 32;
+        float w = float(q) * sc;
+        partial += a[k] * w;
+    }
+
+    sdata[tid] = partial;
+    barrier();
+    for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    if (tid == 0u) c[n] = sdata[0];
+}

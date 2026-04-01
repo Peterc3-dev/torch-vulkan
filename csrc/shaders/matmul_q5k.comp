@@ -1,0 +1,77 @@
+#version 450
+// Native Q5_K matmul — correct llama.cpp interleaved layout.
+// Q5_K: 176 bytes = [2B d][2B dmin][12B scales][32B qh][128B qs]
+// qs layout: same as Q4_K (pairs of 32, low/high nibble)
+// qh layout: qh[l] bit (sub) gives the 5th bit for element at sub*32+l
+//   NOT a linear bitmap. Each byte qh[l] has bits for all 8 sub-blocks at position l.
+// Dispatch: [N, 1, 1] workgroups of 256.
+
+#define WG_SIZE 256
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { uint b_data[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; } params;
+
+shared float sdata[WG_SIZE];
+
+uint rb(uint off) { return (b_data[off >> 2] >> ((off & 3u) * 8u)) & 0xFFu; }
+float fp16(uint off) { return unpackHalf2x16(rb(off) | (rb(off+1u)<<8u)).x; }
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint bpr = params.K / 256u;
+    uint row_off = n * bpr * 176u;
+    float partial = 0.0;
+
+    for (uint k = tid; k < params.K; k += WG_SIZE) {
+        uint blk = k / 256u;
+        uint pos = k % 256u;
+        uint bo = row_off + blk * 176u;
+
+        float d = fp16(bo);
+        float dmin = fp16(bo + 2u);
+
+        uint sub = pos / 32u;
+        uint j = pos % 32u;
+
+        // 6-bit scales (same as Q4_K)
+        uint sc_val, mn_val;
+        if (sub < 4u) {
+            sc_val = rb(bo + 4u + sub) & 0x3Fu;
+            mn_val = rb(bo + 8u + sub) & 0x3Fu;
+        } else {
+            uint i = sub - 4u;
+            sc_val = (rb(bo + 12u + i) & 0x0Fu) | ((rb(bo + 4u + i) >> 6u) << 4u);
+            mn_val = (rb(bo + 12u + i) >> 4u) | ((rb(bo + 8u + i) >> 6u) << 4u);
+        }
+        float sc = d * float(sc_val);
+        float mn = dmin * float(mn_val);
+
+        // 5th bit from qh: qh[j] bit (sub) — NOT linear bitmap
+        uint qh_byte = rb(bo + 16u + j);  // qh starts at offset 16
+        uint qh_bit = (qh_byte >> sub) & 1u;
+
+        // Low 4 bits from qs: interleaved pairs (same as Q4_K)
+        uint pair = sub / 2u;
+        uint q_byte = rb(bo + 48u + pair * 32u + j);  // qs starts at offset 48
+        uint qi_lo = ((sub & 1u) == 0u) ? (q_byte & 0x0Fu) : ((q_byte >> 4u) & 0x0Fu);
+
+        uint qi = qi_lo | (qh_bit << 4u);
+        float w = float(qi) * sc - mn;
+        partial += a[k] * w;
+    }
+
+    sdata[tid] = partial;
+    barrier();
+    for (uint s = WG_SIZE/2u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    if (tid == 0u) c[n] = sdata[0];
+}
