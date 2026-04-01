@@ -1,13 +1,14 @@
 #version 450
-// Native Q4_K matmul — correct llama.cpp interleaved layout.
-// Q4_K: 144 bytes per 256 elements = [2B d][2B dmin][12B scales][128B qs]
-// qs layout: 4 pairs of (32 low nibble elems, 32 high nibble elems) sharing 32 bytes.
-// pair p (0-3): elements [p*64..p*64+31] use qs[p*32..p*32+31] & 0xF
-//               elements [p*64+32..p*64+63] use qs[p*32..p*32+31] >> 4
-// Sub-blocks: sub = pos/32, scale from get_scale_min_k4(sub)
-// Dispatch: [N, 1, 1] workgroups of 256 threads.
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Q4_K matmul — wave64 optimized for RDNA.
+// 64 threads per workgroup = exactly 1 wave on RDNA.
+// Pure subgroupAdd reduction — no shared memory, no barriers.
+// Higher occupancy: smaller register footprint → more waves per CU.
+//
+// Q4_K block (144B per 256 elements): [d:2][dmin:2][scales:12][qs:128]
+// Dispatch: [N, 1, 1] workgroups of 64 threads.
 
-#define WG_SIZE 256
+#define WG_SIZE 64
 layout(local_size_x = WG_SIZE) in;
 
 layout(set = 0, binding = 0) buffer BufA { float a[]; };
@@ -15,8 +16,6 @@ layout(set = 0, binding = 1) buffer BufB { uint b_data[]; };
 layout(set = 0, binding = 2) buffer BufC { float c[]; };
 
 layout(push_constant) uniform PushConstants { uint K; uint N; } params;
-
-shared float sdata[WG_SIZE];
 
 uint rb(uint off) { return (b_data[off >> 2] >> ((off & 3u) * 8u)) & 0xFFu; }
 float fp16(uint off) { return unpackHalf2x16(rb(off) | (rb(off+1u)<<8u)).x; }
@@ -41,7 +40,6 @@ void main() {
         uint sub = pos / 32u;
         uint j = pos % 32u;
 
-        // 6-bit scales
         uint sc_val, mn_val;
         if (sub < 4u) {
             sc_val = rb(bo + 4u + sub) & 0x3Fu;
@@ -54,20 +52,14 @@ void main() {
         float sc = d * float(sc_val);
         float mn = dmin * float(mn_val);
 
-        // qs: interleaved pairs. pair = sub/2, low/high = sub%2
         uint pair = sub / 2u;
         uint q_byte = rb(bo + 16u + pair * 32u + j);
         uint qi = ((sub & 1u) == 0u) ? (q_byte & 0x0Fu) : ((q_byte >> 4u) & 0x0Fu);
 
-        float w = float(qi) * sc - mn;
-        partial += a[k] * w;
+        partial += a[k] * (float(qi) * sc - mn);
     }
 
-    sdata[tid] = partial;
-    barrier();
-    for (uint s = WG_SIZE/2u; s > 0u; s >>= 1u) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        barrier();
-    }
-    if (tid == 0u) c[n] = sdata[0];
+    // Single subgroupAdd — entire workgroup is one wave, no barriers needed
+    float sum = subgroupAdd(partial);
+    if (tid == 0u) c[n] = sum;
 }
