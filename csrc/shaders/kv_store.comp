@@ -1,0 +1,28 @@
+#version 450
+// Copy K and V segments from QKV buffer into KV cache at position `pos`.
+// QKV layout: [Q: n_heads*head_dim | K: n_kv_heads*head_dim | V: n_kv_heads*head_dim]
+// K_cache/V_cache layout: [pos * n_kv_heads * head_dim + ...]
+//
+// Push: pos, q_len (= n_heads*head_dim), kv_len (= n_kv_heads*head_dim)
+// Dispatch: [ceil(kv_len/256), 1, 1]
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufQKV { float qkv[]; };
+layout(set = 0, binding = 1) buffer BufK   { float k_cache[]; };
+layout(set = 0, binding = 2) buffer BufV   { float v_cache[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint pos;
+    uint q_len;    // N_HEADS * HEAD_DIM
+    uint kv_len;   // N_KV_HEADS * HEAD_DIM
+} params;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.kv_len) return;
+
+    uint cache_off = params.pos * params.kv_len + i;
+    k_cache[cache_off] = qkv[params.q_len + i];
+    v_cache[cache_off] = qkv[params.q_len + params.kv_len + i];
+}
