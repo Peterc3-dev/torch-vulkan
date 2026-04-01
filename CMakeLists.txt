@@ -49,6 +49,7 @@ add_library(torch_vulkan_C SHARED
   csrc/vulkan_context.cpp
   csrc/vulkan_allocator.cpp
   csrc/ops/mm.cpp
+  csrc/vulkan_engine.cpp
 )
 
 target_include_directories(torch_vulkan_C PRIVATE

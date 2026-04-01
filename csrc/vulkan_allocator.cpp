@@ -12,21 +12,33 @@ VulkanAllocator& VulkanAllocator::instance() {
 }
 
 c10::DataPtr VulkanAllocator::allocate(size_t nbytes) {
-  fprintf(stderr, "ALLOC: nbytes=%zu\n", nbytes);
   if (nbytes == 0) {
     return c10::DataPtr(nullptr, c10::Device(c10::DeviceType::PrivateUse1, 0));
   }
 
-  fprintf(stderr, "ALLOC: getting manager\n");
-  auto& mgr = VulkanContext::instance().manager();
-  fprintf(stderr, "ALLOC: got manager\n");
-
   size_t num_floats = (nbytes + sizeof(float) - 1) / sizeof(float);
-  std::vector<float> zeros(num_floats, 0.0f);
 
-  fprintf(stderr, "ALLOC: creating kompute tensor, num_floats=%zu\n", num_floats);
-  auto tensor = mgr.tensor(zeros);
-  fprintf(stderr, "ALLOC: tensor created\n");
+  std::shared_ptr<kp::TensorT<float>> tensor;
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Phase 4: Check free list for a reusable buffer of the same size.
+    auto it = free_list_.find(num_floats);
+    if (it != free_list_.end() && !it->second.empty()) {
+      tensor = std::move(it->second.back());
+      it->second.pop_back();
+      // Zero out the reused buffer for safety
+      std::memset(tensor->data(), 0, num_floats * sizeof(float));
+    }
+  }
+
+  if (!tensor) {
+    // No reusable buffer found — create a new Kompute tensor.
+    auto& mgr = VulkanContext::instance().manager();
+    std::vector<float> zeros(num_floats, 0.0f);
+    tensor = mgr.tensor(zeros);
+  }
 
   void* ptr = tensor->data();
 
@@ -50,7 +62,18 @@ void VulkanAllocator::deleter(void* ptr) {
   if (!ptr) return;
   auto& alloc = VulkanAllocator::instance();
   std::lock_guard<std::mutex> lock(alloc.mutex_);
-  alloc.tensor_map_.erase(ptr);
+
+  auto it = alloc.tensor_map_.find(ptr);
+  if (it == alloc.tensor_map_.end()) return;
+
+  // Phase 4: Instead of destroying the Kompute tensor, move it to the free
+  // list keyed by size. The next allocation of the same size will reuse this
+  // buffer, getting the same data pointer, which means the algorithm cache
+  // in VulkanContext will match and reuse the compiled VkPipeline.
+  auto tensor = std::move(it->second);
+  size_t num_floats = tensor->size();
+  alloc.free_list_[num_floats].push_back(std::move(tensor));
+  alloc.tensor_map_.erase(it);
 }
 
 void VulkanAllocator::copy_data(void* dest, const void* src, std::size_t count) const {

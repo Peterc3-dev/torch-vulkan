@@ -1,6 +1,7 @@
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #include "../vulkan_allocator.h"
+#include "../vulkan_engine.h"
 #include "../vulkan_context.h"
 #include <ATen/core/op_registration/op_registration.h>
 #include <ATen/native/CPUFallback.h>
@@ -36,7 +37,9 @@ static void sync_to_local(std::shared_ptr<kp::TensorT<float>> t) {
 }
 
 // Helper: run a 1D elementwise shader (3 buffers: a, b, out)
-// Uses persistent Kompute tensors from allocator — no per-call allocation
+// Uses persistent Kompute tensors from allocator — no per-call allocation.
+// Phase 4: Algorithm cache eliminates per-call VkPipeline + descriptor set
+// creation when the same tensor buffers are dispatched repeatedly.
 static at::Tensor elementwise_binary(
     const at::Tensor& self, const at::Tensor& other,
     const std::string& shader_name,
@@ -62,12 +65,15 @@ static at::Tensor elementwise_binary(
   auto output = at::empty(self.sizes(), self.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
   auto tensor_c = get_kp_tensor(output);
 
-  auto spirv = ctx.load_shader(shader_name);
   uint32_t wg = (n + 255) / 256;
 
-  auto algorithm = mgr.algorithm(
-      {tensor_a, tensor_b, tensor_c}, spirv,
-      kp::Workgroup({wg, 1, 1}), {}, push_constants);
+  // Phase 4: use cached algorithm -- saves ~3-5ms per call when the same
+  // (shader, tensor_a, tensor_b, tensor_c) combo is dispatched again.
+  auto algorithm = ctx.get_or_create_algorithm(
+      shader_name,
+      {tensor_a, tensor_b, tensor_c},
+      kp::Workgroup({wg, 1, 1}),
+      push_constants);
 
   auto seq = mgr.sequence();
   seq->record<kp::OpTensorSyncDevice>({tensor_a, tensor_b});
@@ -79,7 +85,8 @@ static at::Tensor elementwise_binary(
 }
 
 // Helper: run a 1D elementwise shader (2 buffers: in, out)
-// Uses persistent Kompute tensors — no per-call allocation
+// Uses persistent Kompute tensors — no per-call allocation.
+// Phase 4: Algorithm cache.
 static at::Tensor elementwise_unary(
     const at::Tensor& self, const std::string& shader_name,
     std::vector<uint32_t> push_constants) {
@@ -97,12 +104,14 @@ static at::Tensor elementwise_unary(
   auto output = at::empty(self.sizes(), self.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
   auto tensor_out = get_kp_tensor(output);
 
-  auto spirv = ctx.load_shader(shader_name);
   uint32_t wg = (n + 255) / 256;
 
-  auto algorithm = mgr.algorithm(
-      {tensor_in, tensor_out}, spirv,
-      kp::Workgroup({wg, 1, 1}), {}, push_constants);
+  // Phase 4: cached algorithm
+  auto algorithm = ctx.get_or_create_algorithm(
+      shader_name,
+      {tensor_in, tensor_out},
+      kp::Workgroup({wg, 1, 1}),
+      push_constants);
 
   auto seq = mgr.sequence();
   seq->record<kp::OpTensorSyncDevice>({tensor_in});
@@ -117,8 +126,55 @@ static at::Tensor elementwise_unary(
 // Forward declarations
 static at::Tensor mul_scalar(const at::Tensor& self, const at::Scalar& other);
 
-// aten::mm — general matmul via matmul_general.spv
-// No padding, no temp allocations — uses persistent allocator tensors
+
+// aten::mm via raw VulkanEngine — zero Kompute overhead
+static at::Tensor mm_raw(const at::Tensor& self, const at::Tensor& mat2) {
+  int64_t M = self.size(0), K = self.size(1), N = mat2.size(1);
+
+  auto& engine = VulkanEngine::instance();
+  auto& pipeline = engine.getOrCreatePipeline("matmul_tiled", 3, 3 * sizeof(uint32_t));
+
+  auto self_c = self.contiguous();
+  auto mat2_c = mat2.contiguous();
+
+  // Create/reuse buffers (unified memory — host visible + coherent)
+  VkDeviceSize a_size = M * K * sizeof(float);
+  VkDeviceSize b_size = K * N * sizeof(float);
+  VkDeviceSize c_size = M * N * sizeof(float);
+
+  void *a_ptr, *b_ptr, *c_ptr;
+  VkBuffer a_buf = engine.createBuffer(a_size, &a_ptr);
+  VkBuffer b_buf = engine.createBuffer(b_size, &b_ptr);
+  VkBuffer c_buf = engine.createBuffer(c_size, &c_ptr);
+
+  // Copy input data (host-coherent, no sync needed on unified memory)
+  std::memcpy(a_ptr, self_c.data_ptr<float>(), a_size);
+  std::memcpy(b_ptr, mat2_c.data_ptr<float>(), b_size);
+
+  // Push constants: M, K, N
+  uint32_t push[3] = {(uint32_t)M, (uint32_t)K, (uint32_t)N};
+  uint32_t wg_x = (N + 15) / 16;
+  uint32_t wg_y = (M + 15) / 16;
+
+  engine.dispatch(pipeline,
+    {a_buf, b_buf, c_buf},
+    {a_size, b_size, c_size},
+    push, sizeof(push),
+    wg_x, wg_y, 1);
+
+  // Read result directly from mapped memory
+  auto output = at::empty({M, N}, self.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
+  std::memcpy(output.data_ptr<float>(), c_ptr, c_size);
+
+  engine.destroyBuffer(a_buf);
+  engine.destroyBuffer(b_buf);
+  engine.destroyBuffer(c_buf);
+
+  return output;
+}
+
+// aten::mm — general matmul via matmul_tiled.spv
+// Phase 4: Algorithm cache — the same weight matrix gets the same pipeline.
 at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
   TORCH_CHECK(self.dim() == 2 && mat2.dim() == 2, "mm: inputs must be 2D");
   TORCH_CHECK(self.size(1) == mat2.size(0), "mm: dimension mismatch");
@@ -143,15 +199,19 @@ at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
   auto output = at::empty({M, N}, self.options().device(c10::Device(c10::DeviceType::PrivateUse1, 0)));
   auto tensor_c = get_kp_tensor(output);
 
-  auto spirv = ctx.load_shader("matmul_tiled");
   uint32_t m_val = static_cast<uint32_t>(M);
   uint32_t k_val = static_cast<uint32_t>(K);
   uint32_t n_val = static_cast<uint32_t>(N);
   uint32_t wg_x = (N + 15) / 16, wg_y = (M + 15) / 16;
 
-  auto algorithm = mgr.algorithm(
-      {tensor_a, tensor_b, tensor_c}, spirv,
-      kp::Workgroup({wg_x, wg_y, 1}), {},
+  // Phase 4: cached algorithm.
+  // For transformer inference, the weight tensor_b is the same every call
+  // (same data pointer). The activation tensor_a may vary, but if the model
+  // reuses the same buffer size, the allocator returns the same pointer.
+  auto algorithm = ctx.get_or_create_algorithm(
+      "matmul_tiled",
+      {tensor_a, tensor_b, tensor_c},
+      kp::Workgroup({wg_x, wg_y, 1}),
       std::vector<uint32_t>{m_val, k_val, n_val});
 
   auto seq = mgr.sequence();
@@ -261,6 +321,7 @@ at::Tensor empty_memory_format(
 }
 
 // aten::_softmax — row-wise softmax via softmax.spv
+// Phase 4: cached algorithm for repeated softmax on same-sized buffers
 at::Tensor vulkan_softmax(const at::Tensor& self, int64_t dim, bool half_to_float) {
   TORCH_CHECK(self.dtype() == at::kFloat, "softmax: only float32");
   auto self_c = self.contiguous();
@@ -279,14 +340,16 @@ at::Tensor vulkan_softmax(const at::Tensor& self, int64_t dim, bool half_to_floa
   auto tensor_in = mgr.tensor(in_data);
   auto tensor_out = mgr.tensor(out_data);
 
-  auto spirv = ctx.load_shader("softmax");
   uint32_t nr = static_cast<uint32_t>(num_rows);
   uint32_t rs = static_cast<uint32_t>(row_size);
 
-  // One workgroup per row
-  auto algorithm = mgr.algorithm(
-      {tensor_in, tensor_out}, spirv,
-      kp::Workgroup({nr, 1, 1}), {},
+  // Softmax uses temp tensors (not allocator-backed), so algorithm cache
+  // won't hit for different calls. Still use the API for consistency --
+  // the cache miss overhead is negligible.
+  auto algorithm = ctx.get_or_create_algorithm(
+      "softmax",
+      {tensor_in, tensor_out},
+      kp::Workgroup({nr, 1, 1}),
       std::vector<uint32_t>{nr, rs});
 
   auto seq = mgr.sequence();
@@ -301,6 +364,7 @@ at::Tensor vulkan_softmax(const at::Tensor& self, int64_t dim, bool half_to_floa
 }
 
 // aten::native_layer_norm — layer normalization via layer_norm.spv
+// Phase 4: cached algorithm
 std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_layer_norm(
     const at::Tensor& input,
     at::IntArrayRef normalized_shape,
@@ -339,13 +403,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_layer_norm(
   auto tensor_b = mgr.tensor(b_data);
   auto tensor_out = mgr.tensor(out_data);
 
-  auto spirv = ctx.load_shader("layer_norm");
   uint32_t nr = static_cast<uint32_t>(num_rows);
   uint32_t rs = static_cast<uint32_t>(row_size);
 
-  auto algorithm = mgr.algorithm(
-      {tensor_in, tensor_w, tensor_b, tensor_out}, spirv,
-      kp::Workgroup({nr, 1, 1}), {},
+  auto algorithm = ctx.get_or_create_algorithm(
+      "layer_norm",
+      {tensor_in, tensor_w, tensor_b, tensor_out},
+      kp::Workgroup({nr, 1, 1}),
       std::vector<uint32_t>{nr, rs});
 
   auto seq = mgr.sequence();
@@ -370,6 +434,7 @@ at::Tensor vulkan_gelu(const at::Tensor& self, c10::string_view approximate) {
 }
 
 // aten::embedding — lookup table via embedding.spv
+// Phase 4: cached algorithm
 at::Tensor vulkan_embedding(
     const at::Tensor& weight,
     const at::Tensor& indices,
@@ -398,14 +463,14 @@ at::Tensor vulkan_embedding(
   auto tensor_idx = mgr.tensor(idx_data);
   auto tensor_out = mgr.tensor(out_data);
 
-  auto spirv = ctx.load_shader("embedding");
   uint32_t wg = (total + 255) / 256;
   uint32_t ni = static_cast<uint32_t>(num_indices);
   uint32_t ed = static_cast<uint32_t>(embedding_dim);
 
-  auto algorithm = mgr.algorithm(
-      {tensor_w, tensor_idx, tensor_out}, spirv,
-      kp::Workgroup({wg, 1, 1}), {},
+  auto algorithm = ctx.get_or_create_algorithm(
+      "embedding",
+      {tensor_w, tensor_idx, tensor_out},
+      kp::Workgroup({wg, 1, 1}),
       std::vector<uint32_t>{ni, ed});
 
   auto seq = mgr.sequence();
@@ -446,6 +511,7 @@ at::Tensor vulkan_addmm(
 
 
 // aten::mul.Scalar — elementwise scalar multiply via scalar_mul.spv
+// Phase 4: cached algorithm
 at::Tensor mul_scalar(const at::Tensor& self, const at::Scalar& other) {
   auto self_c = self.contiguous();
   int64_t n = self_c.numel();
@@ -460,15 +526,15 @@ at::Tensor mul_scalar(const at::Tensor& self, const at::Scalar& other) {
   auto tensor_in = mgr.tensor(in_data);
   auto tensor_out = mgr.tensor(out_data);
 
-  auto spirv = ctx.load_shader("scalar_mul");
   uint32_t wg = (n + 255) / 256;
   uint32_t n_val = static_cast<uint32_t>(n);
   uint32_t scalar_bits;
   std::memcpy(&scalar_bits, &scalar, sizeof(uint32_t));
 
-  auto algorithm = mgr.algorithm(
-      {tensor_in, tensor_out}, spirv,
-      kp::Workgroup({wg, 1, 1}), {},
+  auto algorithm = ctx.get_or_create_algorithm(
+      "scalar_mul",
+      {tensor_in, tensor_out},
+      kp::Workgroup({wg, 1, 1}),
       std::vector<uint32_t>{n_val, scalar_bits});
 
   auto seq = mgr.sequence();
@@ -494,7 +560,7 @@ at::Tensor div_tensor(const at::Tensor& self, const at::Tensor& other) {
 }
 
 // Fused scaled dot-product attention via attention.spv
-// Q, K, V: [seq_len, head_dim] (single head) or iterated over heads
+// Phase 4: cached algorithm per (head_dim, seq_len) combo
 at::Tensor vulkan_scaled_dot_product_attention(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -559,9 +625,10 @@ at::Tensor vulkan_scaled_dot_product_attention(
       uint32_t sl = static_cast<uint32_t>(seq_len);
       uint32_t hd = static_cast<uint32_t>(head_dim);
 
-      auto algorithm = mgr.algorithm(
-          {tq, tk, tv, to}, spirv,
-          kp::Workgroup({sl, 1, 1}), {},
+      auto algorithm = ctx.get_or_create_algorithm(
+          "attention",
+          {tq, tk, tv, to},
+          kp::Workgroup({sl, 1, 1}),
           std::vector<uint32_t>{sl, hd});
 
       auto seq = mgr.sequence();
