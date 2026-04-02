@@ -1,66 +1,62 @@
 #version 450
-// Single-token GQA attention with f16 KV cache.
-// Q is f32 (from QKV matmul). K/V cache is packed f16 (2 per uint32).
-// Dot products and accumulation in f32 for numerical stability.
+// Single-token GQA attention with f16 KV cache and dynamic head_dim.
+// Supports head_dim=64, 128 (or any power of 2 up to 128).
+// Workgroup is always 128 threads; threads >= head_dim are idle.
 //
-// Dispatch: [N_HEADS, 1, 1] workgroups of 128 (HEAD_DIM).
+// Dispatch: [N_HEADS, 1, 1] workgroups of 128.
+// Push: seq_len, n_kv_heads, heads_per_kv, head_dim
 
-#define HEAD_DIM 128
+#define WG_SIZE 128
 #define MAX_SEQ 2048
 
-layout(local_size_x = HEAD_DIM) in;
+layout(local_size_x = WG_SIZE) in;
 
 layout(set = 0, binding = 0) buffer BufQ   { float q_data[]; };
-layout(set = 0, binding = 1) buffer BufK   { uint k_packed[]; };   // f16 pairs
-layout(set = 0, binding = 2) buffer BufV   { uint v_packed[]; };   // f16 pairs
+layout(set = 0, binding = 1) buffer BufK   { uint k_packed[]; };
+layout(set = 0, binding = 2) buffer BufV   { uint v_packed[]; };
 layout(set = 0, binding = 3) buffer BufOut { float out_data[]; };
 
 layout(push_constant) uniform PushConstants {
     uint seq_len;
     uint n_kv_heads;
     uint heads_per_kv;
+    uint head_dim;
 } params;
 
-shared float s_reduce[HEAD_DIM];
+shared float s_reduce[WG_SIZE];
 shared float s_scores[MAX_SEQ];
-
-// Read one f16 from packed uint32 array at linear index `idx`
-float read_f16(uint base_word, uint idx) {
-    uint word = base_word;  // precomputed word index not possible here, read inline
-    uint w = idx / 2u;
-    vec2 pair = unpackHalf2x16(base_word);
-    // Actually we need to index into the array:
-    return 0.0; // placeholder
-}
 
 void main() {
     uint h = gl_WorkGroupID.x;
     uint d = gl_LocalInvocationID.x;
+    uint hd = params.head_dim;
     uint kv_h = h / params.heads_per_kv;
     uint seq_len = params.seq_len;
-    uint kv_stride = params.n_kv_heads * HEAD_DIM;
+    uint kv_stride = params.n_kv_heads * hd;
 
-    float scale = 1.0 / sqrt(float(HEAD_DIM));
-    float q_val = q_data[h * HEAD_DIM + d];
+    float scale = 1.0 / sqrt(float(hd));
+    float q_val = (d < hd) ? q_data[h * hd + d] : 0.0;
 
     // Phase 1: Q·K scores
     for (uint j = 0; j < seq_len; j++) {
-        uint linear = j * kv_stride + kv_h * HEAD_DIM + d;
-        uint word_idx = linear / 2u;
-        vec2 pair = unpackHalf2x16(k_packed[word_idx]);
-        float k_val = ((linear & 1u) == 0u) ? pair.x : pair.y;
-
-        s_reduce[d] = q_val * k_val;
+        float prod = 0.0;
+        if (d < hd) {
+            uint linear = j * kv_stride + kv_h * hd + d;
+            uint word_idx = linear / 2u;
+            vec2 pair = unpackHalf2x16(k_packed[word_idx]);
+            float k_val = ((linear & 1u) == 0u) ? pair.x : pair.y;
+            prod = q_val * k_val;
+        }
+        s_reduce[d] = prod;
         barrier();
 
-        for (uint s = HEAD_DIM / 2; s > 0; s >>= 1) {
+        // Tree reduction — always WG_SIZE steps (extra threads contribute 0)
+        for (uint s = WG_SIZE / 2; s > 0; s >>= 1) {
             if (d < s) s_reduce[d] += s_reduce[d + s];
             barrier();
         }
 
-        if (d == 0) {
-            s_scores[j] = s_reduce[0] * scale;
-        }
+        if (d == 0) s_scores[j] = s_reduce[0] * scale;
         barrier();
     }
 
@@ -81,13 +77,15 @@ void main() {
     barrier();
 
     // Phase 3: Weighted V sum
-    float acc = 0.0;
-    for (uint j = 0; j < seq_len; j++) {
-        uint linear = j * kv_stride + kv_h * HEAD_DIM + d;
-        uint word_idx = linear / 2u;
-        vec2 pair = unpackHalf2x16(v_packed[word_idx]);
-        float v_val = ((linear & 1u) == 0u) ? pair.x : pair.y;
-        acc += s_scores[j] * v_val;
+    if (d < hd) {
+        float acc = 0.0;
+        for (uint j = 0; j < seq_len; j++) {
+            uint linear = j * kv_stride + kv_h * hd + d;
+            uint word_idx = linear / 2u;
+            vec2 pair = unpackHalf2x16(v_packed[word_idx]);
+            float v_val = ((linear & 1u) == 0u) ? pair.x : pair.y;
+            acc += s_scores[j] * v_val;
+        }
+        out_data[h * hd + d] = acc;
     }
-    out_data[h * HEAD_DIM + d] = acc;
 }
